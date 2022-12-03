@@ -14,13 +14,12 @@ from torch.optim import SGD
 
 from cifar_config import Config
 import losses
-from models.channel_distillation import ChannelDistillResNet50152, ChannelDistillResNet1834
+from models.channel_distillation import ChannelDistillResNet1834
 from utils.average_meter import AverageMeter
 from utils.data_prefetcher import DataPrefetcher
 from utils.logutil import get_logger
 from utils.metric import accuracy
 from utils.util import adjust_loss_alpha
-from tqdm import tqdm
 
 
 def main():
@@ -31,7 +30,6 @@ def main():
     torch.cuda.manual_seed_all(0)
     cudnn.benchmark = True
     cudnn.enabled = True
-
     logger = get_logger(__name__, Config.log)
 
     Config.gpus = torch.cuda.device_count()
@@ -43,8 +41,6 @@ def main():
     logger.info(f"args: {config}")
 
     start_time = time.time()
-
-    # dataset and dataloader
     logger.info("start loading data")
 
     train_transform = transforms.Compose([
@@ -89,11 +85,8 @@ def main():
     )
     logger.info("finish loading data")
 
-    # network
     net = ChannelDistillResNet1834(Config.num_classes, Config.dataset_type)
     net = net.cuda()
-
-    # loss and optimizer
     criterion = []
     for loss_item in Config.loss_list:
         loss_name = loss_item["loss_name"]
@@ -106,10 +99,7 @@ def main():
     optimizer = SGD(net.parameters(), lr=Config.lr,
                     momentum=0.9, weight_decay=5e-4)
     scheduler = MultiStepLR(optimizer, milestones=[60, 120, 160], gamma=0.2)
-
-    # only evaluate
     if Config.evaluate:
-        # load best model
         if not os.path.isfile(Config.evaluate):
             raise Exception(
                 f"{Config.evaluate} is not a file, please check it again")
@@ -122,9 +112,7 @@ def main():
         logger.info(
             f"epoch {checkpoint['epoch']:0>3d}, top1 acc: {prec1:.2f}%, top5 acc: {prec5:.2f}%")
         return
-
     start_epoch = 1
-    # resume training
     if os.path.exists(Config.resume):
         logger.info(f"start resuming model from {Config.resume}")
         checkpoint = torch.load(
@@ -141,7 +129,6 @@ def main():
 
     if not os.path.exists(Config.checkpoints):
         os.makedirs(Config.checkpoints)
-
     logger.info("start training")
     best_acc = 0.
     best_acc5 = 0.
@@ -150,12 +137,9 @@ def main():
                                    epoch, logger)
         logger.info(
             f"train: epoch {epoch:0>3d}, top1 acc: {prec1:.2f}%, top5 acc: {prec5:.2f}%")
-
         prec1, prec5 = validate(val_loader, net)
         logger.info(
             f"val: epoch {epoch:0>3d}, top1 acc: {prec1:.2f}%, top5 acc: {prec5:.2f}%")
-
-        # remember best prec@1 and save checkpoint
         torch.save(
             {
                 "epoch": epoch,
@@ -183,7 +167,6 @@ def train(train_loader, net, criterion, optimizer, scheduler, epoch, logger):
     top1 = AverageMeter()
     top5 = AverageMeter()
     loss_total = AverageMeter()
-
     loss_ams = [AverageMeter()] * len(criterion)
     loss_alphas = []
     for loss_item in Config.loss_list:
@@ -195,22 +178,21 @@ def train(train_loader, net, criterion, optimizer, scheduler, epoch, logger):
             adjust_loss_alpha(loss_rate, epoch, factor, loss_type,
                               loss_rate_decay, Config.dataset_type)
         )
-
+    lrate = 6
+    lfactor = 0.9
+    ltype = "fd_family"
+    ldecay = "lrdv1"
+    rkdalpha = adjust_loss_alpha(
+        lrate, epoch, lfactor, ltype, ldecay, Config.dataset_type)
     # switch to train mode
     net.train()
-
     iters = len(train_loader.dataset) // Config.batch_size
     prefetcher = DataPrefetcher(train_loader)
     inputs, labels = prefetcher.next()
     iter = 1
-
     while inputs is not None:
         inputs, labels = inputs.float().cuda(), labels.cuda()
-
-        # zero the parameter gradients
         optimizer.zero_grad()
-
-        # forward + backward + optimize
         stu_outputs, tea_outputs = net(inputs)
         loss = 0
         loss_detail = []
@@ -223,26 +205,23 @@ def train(train_loader, net, criterion, optimizer, scheduler, epoch, logger):
                 tmp_loss = loss_alphas[i] * \
                     criterion[i](stu_outputs[-1], tea_outputs[-1])
             elif loss_type == "kdv2_family":
-                tmp_loss = loss_alphas[i] * \
-                    criterion[i](stu_outputs[-1], tea_outputs[-1], labels)
+                tmp_loss = loss_alphas[i] * criterion[i](
+                    stu_outputs[-1], tea_outputs[-1], labels, epoch)
             elif loss_type == "fd_family":
-                tmp_loss = loss_alphas[i] * \
-                    criterion[i](stu_outputs[:-1], tea_outputs[:-1])
+                tloss, rkdloss = criterion[i](
+                    stu_outputs[:-1], tea_outputs[:-1])
+                tmp_loss = loss_alphas[i] * tloss + rkdalpha * rkdloss
 
             loss_detail.append(tmp_loss.item())
             loss_ams[i].update(tmp_loss.item(), inputs.size(0))
             loss += tmp_loss
-
         loss.backward()
         optimizer.step()
-
         prec1, prec5 = accuracy(stu_outputs[-1], labels, topk=(1, 5))
         top1.update(prec1.item(), inputs.size(0))
         top5.update(prec5.item(), inputs.size(0))
         loss_total.update(loss.item(), inputs.size(0))
-
         inputs, labels = prefetcher.next()
-
         if iter % 20 == 0:
             loss_log = f"train: epoch {epoch:0>3d}, iter [{iter:0>4d}, {iters:0>4d}], lr: {scheduler.get_lr()[0]:.6f}, "
             loss_log += f"top1 acc: {prec1.item():.2f}%, top5 acc: {prec5.item():.2f}%, "
@@ -251,9 +230,7 @@ def train(train_loader, net, criterion, optimizer, scheduler, epoch, logger):
                 loss_name = loss_item["loss_name"]
                 loss_log += f"{loss_name}: {loss_detail[i]:3f}, alpha: {loss_alphas[i]:3f}, "
             logger.info(loss_log)
-
         iter += 1
-
     scheduler.step()
 
     return top1.avg, top5.avg, loss_total.avg
@@ -262,19 +239,14 @@ def train(train_loader, net, criterion, optimizer, scheduler, epoch, logger):
 def validate(val_loader, net):
     top1 = AverageMeter()
     top5 = AverageMeter()
-
-    # switch to evaluate mode
     net.eval()
-
     prefetcher = DataPrefetcher(val_loader)
     inputs, labels = prefetcher.next()
     with torch.no_grad():
         while inputs is not None:
             inputs = inputs.float().cuda()
             labels = labels.cuda()
-
             stu_outputs, _ = net(inputs)
-
             pred1, pred5 = accuracy(stu_outputs[-1], labels, topk=(1, 5))
             top1.update(pred1.item(), inputs.size(0))
             top5.update(pred5.item(), inputs.size(0))
